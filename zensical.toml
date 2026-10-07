@@ -36,6 +36,8 @@ nav = [
   { "Development" = [
     "development/demo-deployment.md",
     "development/testing.md",
+    "development/observability/otel-plan.md",
+    "development/observability/claude-agent-sdk-observability.md",
   ] },
   { "Roadmap" = "roadmap/index.md" },
 ]
