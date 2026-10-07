@@ -173,17 +173,106 @@ aidlc.invocation (http-server.js, per POST /invocations)
   `propagation.inject(context.active(), carrier)` and pass `TRACEPARENT` / `TRACESTATE` in the
   `env` passed to `runChild` / `captureChild`. `spawn.js` already merges `env` over
   `process.env`, so no change is needed there.
-- Put the AgentCore session id (`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` request header) on
-  the span as `session.id`, and per-call `OTEL_RESOURCE_ATTRIBUTES` on the child for
-  `aidlc.intent_id`, `aidlc.stage`, `aidlc.project_id`, `enduser.id` (percent-encode values). The
-  CLI's own `session.id` is its conversation id (the `--session-id` we already force), which you
-  can also store in the process table to join the two.
+- Tag every span with the business IDs from
+  [Identity and correlation](#identity-and-correlation-intent-vs-lane). **Do not** use the
+  AgentCore runtime session id as `session.id` on our spans: parallel unit lanes run in separate
+  runtime sessions, so one intent would split into many "sessions".
 - **Park/resume:** a resume can come hours later in a new invocation. Start a new trace for the
   resume and add a **span link** to the original stage span (persist its trace/span id in
   `V2_PROCESS_TABLE`) instead of reusing the old `TRACEPARENT`, which would create a trace hours long.
 - **Flush:** the CLI flushes on clean exit with a short bound. The 1 s export intervals plus a
   collector that outlives the child cover the normal case. Call `sdk.shutdown()` / `forceFlush()` on
   the Node side when the invocation ends, since the microVM can be reaped after 900 s idle.
+
+### Identity and correlation (intent vs lane)
+
+Three different IDs are in play, and none of them is "the intent":
+
+| ID | Where it comes from | Granularity |
+| - | - | - |
+| AgentCore `runtimeSessionId` | `aidlc-intent-<id>` (`lambda/intents/index.js:327`); unit lanes get `aidlc-intent-<id>-s<n>-<slug>` (`lambda/v2-orchestrator/section.js:117-118`); compose, discussion, and capabilities use their own | One microVM + mount. **Parallel lanes have separate ones** |
+| Claude Code `session.id` (set automatically on every CLI span, metric, and event) | The `--session-id` UUID; `run-stage.js:477` generates a fresh `randomUUID()` per fresh stage run, and resume reuses it via `--resume` | One stage conversation |
+| AgentCore GenAI dashboard session | Whatever `session.id` our own spans carry, plus the runtime's own per-`runtimeSessionId` spans | Whatever we choose |
+
+Consequences:
+
+- `session.id` is unusable as an intent join key at every layer. It's per stage on CLI spans, per
+  lane on runtime spans, and you **cannot override it**: the Monitoring reference says custom
+  `OTEL_RESOURCE_ATTRIBUTES` keys never override standard attributes such as `session.id`.
+- So **`aidlc.intent.id` is the required join key** on every span, metric, and event, from the
+  orchestrator and from the CLI alike.
+
+Attribute set (orchestrator spans as span attributes; CLI via per-spawn `OTEL_RESOURCE_ATTRIBUTES`):
+
+| Attribute | Value |
+| - | - |
+| `aidlc.intent.id` | intent id (**join key**) |
+| `aidlc.project.id` | project id |
+| `aidlc.run.id` | orchestrator run id (a relaunch gets a new one) |
+| `aidlc.stage` | stage name |
+| `aidlc.section.index` | `sectionIndex` (lanes only) |
+| `aidlc.unit.slug` | `unitSlug` (lanes only) |
+| `aidlc.cli` | `claude` / `kiro` / `opencode` / `codex` |
+| `agentcore.runtime_session_id` | the actual `runtimeSessionId` (microVM), for joining to runtime-level spans |
+| `enduser.id` | requesting user, if attributing actions to people |
+
+`run-stage.js` already receives `unitSlug` and `sectionIndex`, so the CLI-side values are on hand
+where the child is spawned.
+
+Building `OTEL_RESOURCE_ATTRIBUTES`: follow the doc's `enduser.id` / `tenant.id` pattern.
+Percent-encode every value (`encodeURIComponent`), since commas, spaces, and equals signs are
+reserved. Set it **per spawn** in the `env` passed to `runChild` / `captureChild`, never on the
+container's process env, because a microVM serves many invocations. Example helper:
+
+```js
+// cli/otel-env.js
+export const otelResourceAttrs = (attrs) =>
+  Object.entries(attrs)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+    .join(',');
+
+// run-stage.js, at spawn time
+env: {
+  ...invocation.env,
+  OTEL_RESOURCE_ATTRIBUTES: otelResourceAttrs({
+    'aidlc.intent.id': intentId,
+    'aidlc.project.id': projectId,
+    'aidlc.run.id': runId,
+    'aidlc.stage': stage,
+    'aidlc.section.index': sectionIndex,
+    'aidlc.unit.slug': unitSlug,
+    'aidlc.cli': cli,
+    'agentcore.runtime_session_id': runtimeSessionId,
+  }),
+  TRACEPARENT, TRACESTATE,
+}
+```
+
+If a deployment-wide `OTEL_RESOURCE_ATTRIBUTES` is also set in Terraform, append it to the
+per-spawn value rather than letting the per-spawn value replace it.
+
+Choosing the dashboard "session": on our own spans set `session.id` to the **intent**
+(`aidlc-intent-<id>`), so lanes and stages group under one intent session, and keep the real
+microVM id in `agentcore.runtime_session_id`. CLI spans will still carry their per-stage UUID. If
+you want CLI spans grouped by intent in session views too, rewrite it in the collector: copy
+`session.id` to `claude_code.session.id`, then set `session.id` from the resource's
+`aidlc.intent.id`. Copying `aidlc.*` from resource to span attributes in the same `transform` step
+also helps backends that index span attributes better than resource attributes.
+
+Lanes are launched by the **v2-orchestrator Lambda**, not the AgentCore container, so trace context
+has to start there:
+
+- Create a span per section and per lane in `lambda/v2-orchestrator/section.js` (`runLaneBody`)
+  carrying the attributes above, and propagate it into the runtime call. Check whether your
+  `InvokeAgentRuntime` SDK version accepts trace-context fields (`traceParent` / `traceState` /
+  `baggage`); if not, add `traceparent` to the invocation payload and have `http-server.js` extract it.
+- The orchestrator is a durable, replaying workflow (`ctx.step`), so a span created outside a step
+  is re-created on replay. Create spans inside steps and persist the span context with the step's
+  result, or accept one trace per lane run linked by `aidlc.intent.id`. An intent spans hours to
+  days; don't try to make it one trace. Join on `aidlc.intent.id`.
+- Retry rounds (`retry-release-…-r<n>`, `section.js:2200`) stop and re-create the lane session.
+  Add `aidlc.lane.round` so retries are distinguishable within a lane.
 
 ### 5. Version bump
 
@@ -217,10 +306,13 @@ on each CLI's own OTel support; check each separately and point any that support
 - [ ] `otelcol-contrib` in Dockerfile + `otel/collector.yaml` + startup supervision
 - [ ] OTel env in `claudeDriver.envForAuth` (or a new `envForTelemetry`), gated by `AIDLC_OTEL_ENABLED`
 - [ ] Node OTel SDK in `http-server.js`; spans in run-stage / resolve-conflict / one-shot; TRACEPARENT injection
+- [ ] `aidlc.*` identity attributes (percent-encoded, per spawn) incl. `aidlc.intent.id` join key; `session.id` = intent on our spans
+- [ ] v2-orchestrator section/lane spans + trace-context propagation into `InvokeAgentRuntime`
 - [ ] Terraform: IAM, env vars, Transaction Search, VPC endpoints, DD secret
 - [ ] Claude Code bump to ≥ 2.1.283
 - [ ] Tests: `drivers.test.js` asserts telemetry env; `run-stage.test.js` asserts TRACEPARENT is passed to `runChild`
 - [ ] Verify in CloudWatch: one trace per stage, `claude_code.interaction.parent.source == env`
+- [ ] Verify: a multi-lane intent is queryable as one unit by `aidlc.intent.id` in both CloudWatch and Datadog
 
 ## Phase 2 — optional `claude-sdk` driver (Agent SDK alongside `claude -p`)
 
